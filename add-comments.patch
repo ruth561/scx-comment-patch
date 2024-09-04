@@ -1,0 +1,711 @@
+diff --git a/include/linux/sched/ext.h b/include/linux/sched/ext.h
+index 593d2f4909dd..60a4529c6c6a 100644
+--- a/include/linux/sched/ext.h
++++ b/include/linux/sched/ext.h
+@@ -60,6 +60,7 @@ struct scx_dispatch_q {
+ 	raw_spinlock_t		lock;
+ 	struct list_head	list;	/* tasks in dispatch order */
+ 	struct rb_root		priq;	/* used to order by p->scx.dsq_vtime */
++	// このDSQに入っているタスクの数
+ 	u32			nr;
+ 	u32			seq;	/* used by BPF iter */
+ 	u64			id;
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index a28e0daeae61..7982641c694a 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -2043,6 +2043,8 @@ inline int task_curr(const struct task_struct *p)
+ 	return cpu_curr(task_cpu(p)) == p;
+ }
+ 
++// もし、タスクのsched_classが切り替わっていれば、switching_toコールバックを実行する、
++// という関数。
+ /*
+  * ->switching_to() is called with the pi_lock and rq_lock held and must not
+  * mess with locking.
+@@ -5834,6 +5836,11 @@ static void put_prev_task_balance(struct rq *rq, struct task_struct *prev,
+ 	 * when waking up from SCHED_IDLE. If @start_class is below SCX, start
+ 	 * from SCX instead.
+ 	 */
++	// もし、prev_taskのスケジューリングクラスがidleのときでも、
++	// sched_class_ext->balanceが呼び出せるようにするために、
++	// この処理が追加されている。後ろの方の処理では優先度がstart_class
++	// 以下のものに対して順番にbalanceが呼ばれているため、これを
++	// しておけば十分。
+ 	if (sched_class_above(&ext_sched_class, start_class))
+ 		start_class = &ext_sched_class;
+ #endif
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index da9cac6b6cc2..d47452a810cc 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -641,6 +641,7 @@ enum scx_enq_flags {
+ 	/* high 8 bits are internal */
+ 	__SCX_ENQ_INTERNAL_MASK	= 0xffLLU << 56,
+ 
++	// enqueueが無事に完了したらp->scx.ops_stateの値をSCX_OPSS_NONEにセットする（？）
+ 	SCX_ENQ_CLEAR_OPSS	= 1LLU << 56,
+ 	SCX_ENQ_DSQ_PRIQ	= 1LLU << 57,
+ };
+@@ -808,6 +809,7 @@ static struct delayed_work scx_watchdog_work;
+ #define CL_ALIGNED_IF_ONSTACK __cacheline_aligned_in_smp
+ #endif
+ 
++// SCHED_EXT独自のIDLE CPU管理を行うためのデータ構造。
+ static struct {
+ 	cpumask_var_t cpu;
+ 	cpumask_var_t smt;
+@@ -839,6 +841,8 @@ static const struct rhashtable_params dsq_hash_params = {
+ static struct rhashtable dsq_hash;
+ static LLIST_HEAD(dsqs_to_free);
+ 
++// scx_dsp_ctxのバッファのエントリのデータ構造
++// このデータ構造と１つのディスパッチ処理が対応する
+ /* dispatch buf */
+ struct scx_dsp_buf_ent {
+ 	struct task_struct	*task;
+@@ -847,11 +851,18 @@ struct scx_dsp_buf_ent {
+ 	u64			enq_flags;
+ };
+ 
++// バッファのエントリ数
++// ops.dispatch_max_batchに設定された値が使われる
++// もし、ops.dispatch_max_batchが設定されていなかった場合
++// （つまり0だった場合）、SCX_DSP_DFL_MAX_BATCH(=32)が設定される
+ static u32 scx_dsp_max_batch;
+ 
+ struct scx_dsp_ctx {
+ 	struct rq		*rq;
++	// バッファの現在のエントリを指すindex
+ 	u32			cursor;
++	// scx_ops.dispatch()でディスパッチしたタスクの数をカウントする
++	// ためのフィールド。詳しくは、balance_one()関数の実装を見よ。
+ 	u32			nr_tasks;
+ 	struct scx_dsp_buf_ent	buf[];
+ };
+@@ -1300,6 +1311,7 @@ static bool scx_ops_tryset_enable_state(enum scx_ops_enable_state to,
+ 	return atomic_try_cmpxchg(&scx_ops_enable_state_var, &from_v, to);
+ }
+ 
++// ？？？
+ static bool scx_ops_bypassing(void)
+ {
+ 	return unlikely(atomic_read(&scx_ops_bypass_depth));
+@@ -1516,6 +1528,7 @@ static void dispatch_enqueue(struct scx_dispatch_q *dsq, struct task_struct *p,
+ 		     !RB_EMPTY_NODE(&p->scx.dsq_priq));
+ 
+ 	if (!is_local) {
++		// グローバルなDSQに対しては、ロックを取る
+ 		raw_spin_lock(&dsq->lock);
+ 		if (unlikely(dsq->id == SCX_DSQ_INVALID)) {
+ 			scx_ops_error("attempting to dispatch to a destroyed dsq");
+@@ -1526,6 +1539,8 @@ static void dispatch_enqueue(struct scx_dispatch_q *dsq, struct task_struct *p,
+ 		}
+ 	}
+ 
++	// built-inのDSQに対してvtimeによる優先度を考慮したpushをすることはできない。
++	// vtimeを考慮するには、カスタムDSQが必須
+ 	if (unlikely((dsq->id & SCX_DSQ_FLAG_BUILTIN) &&
+ 		     (enq_flags & SCX_ENQ_DSQ_PRIQ))) {
+ 		/*
+@@ -1539,6 +1554,7 @@ static void dispatch_enqueue(struct scx_dispatch_q *dsq, struct task_struct *p,
+ 		enq_flags &= ~SCX_ENQ_DSQ_PRIQ;
+ 	}
+ 
++	// vtimeによる優先度付きキューのDSQへのpushの場合
+ 	if (enq_flags & SCX_ENQ_DSQ_PRIQ) {
+ 		struct rb_node *rbp;
+ 
+@@ -1596,6 +1612,7 @@ static void dispatch_enqueue(struct scx_dispatch_q *dsq, struct task_struct *p,
+ 	p->scx.ddsp_dsq_id = SCX_DSQ_INVALID;
+ 	p->scx.ddsp_enq_flags = 0;
+ 
++	// DSQへのpushが完了したので、遷移中の状態からNONE状態に遷移する
+ 	/*
+ 	 * We're transitioning out of QUEUEING or DISPATCHING. store_release to
+ 	 * match waiters' load_acquire.
+@@ -1701,6 +1718,7 @@ static struct scx_dispatch_q *find_non_local_dsq(u64 dsq_id)
+ 		return find_user_dsq(dsq_id);
+ }
+ 
++// dsq_idをもとに、対応するscx_dispatch_qへのポインタを探して返す関数
+ static struct scx_dispatch_q *find_dsq_for_dispatch(struct rq *rq, u64 dsq_id,
+ 						    struct task_struct *p)
+ {
+@@ -1723,6 +1741,8 @@ static void mark_direct_dispatch(struct task_struct *ddsp_task,
+ 				 struct task_struct *p, u64 dsq_id,
+ 				 u64 enq_flags)
+ {
++	// direct_dispatch_taskにエラー値を設定することで、１つのBPFプログラムから
++	// 複数回この関数が呼び出されないことを保証する。
+ 	/*
+ 	 * Mark that dispatch already happened from ops.select_cpu() or
+ 	 * ops.enqueue() by spoiling direct_dispatch_task with a non-NULL value
+@@ -1730,6 +1750,11 @@ static void mark_direct_dispatch(struct task_struct *ddsp_task,
+ 	 */
+ 	__this_cpu_write(direct_dispatch_task, ERR_PTR(-ESRCH));
+ 
++	// enqueue pathまたはselect_cpu pathで扱われているタスク
++	// （direct_dispatch_taskにセットされているタスク）と、この関数の引数に渡された
++	// pの値は一致している必要がある。
++	// つまり、ops.select_cpuなどの内部から、引数以外のタスクへのポインタを
++	// 渡そうとするとエラーになる。
+ 	/* @p must match the task on the enqueue path */
+ 	if (unlikely(p != ddsp_task)) {
+ 		if (IS_ERR(ddsp_task))
+@@ -1745,6 +1770,8 @@ static void mark_direct_dispatch(struct task_struct *ddsp_task,
+ 	WARN_ON_ONCE(p->scx.ddsp_dsq_id != SCX_DSQ_INVALID);
+ 	WARN_ON_ONCE(p->scx.ddsp_enq_flags);
+ 
++	// p->scx.ddsp_dsq_idにvalidな値がセットされることで、BPFプログラムが終了した
++	// あとにダイレクトディスパッチの処理が行われる
+ 	p->scx.ddsp_dsq_id = dsq_id;
+ 	p->scx.ddsp_enq_flags = enq_flags;
+ }
+@@ -1759,6 +1786,8 @@ static void direct_dispatch(struct task_struct *p, u64 enq_flags)
+ 
+ 	p->scx.ddsp_enq_flags |= enq_flags;
+ 
++	// ddspのときにSCX_DSQ_LOCAL_ONが指定された場合の処理
++	// 詳しくはコミット7d02a8ce62a8fbfbd346f8422fe29308faed7fe9を参照
+ 	/*
+ 	 * We are in the enqueue path with @rq locked and pinned, and thus can't
+ 	 * double lock a remote rq and enqueue to its local DSQ. For
+@@ -1801,7 +1830,10 @@ static void direct_dispatch(struct task_struct *p, u64 enq_flags)
+ 	}
+ 
+ dispatch:
++	// dsq_idをもとにscx_dispatch_qへのポインタを得る
++	// 例えば、SCX_DSQ_LOCALだった場合は、&rq->scx.local_dsqが返される。
+ 	dsq = find_dsq_for_dispatch(rq, dsq_id, p);
++	// enqueueのメイン処理？
+ 	dispatch_enqueue(dsq, p, p->scx.ddsp_enq_flags | SCX_ENQ_CLEAR_OPSS);
+ }
+ 
+@@ -1810,12 +1842,15 @@ static bool scx_rq_online(struct rq *rq)
+ 	return likely(rq->scx.flags & SCX_RQ_ONLINE);
+ }
+ 
++// これは、sched_class.enqueue_taskから呼び出される関数
++// この関数呼び出し前に、select_cpuがすでに呼び出されていることに注意しておく。
+ static void do_enqueue_task(struct rq *rq, struct task_struct *p, u64 enq_flags,
+ 			    int sticky_cpu)
+ {
+ 	struct task_struct **ddsp_taskp;
+ 	unsigned long qseq;
+ 
++	// QUEUEDフラグがセットされていないと警告を出す
+ 	WARN_ON_ONCE(!(p->scx.flags & SCX_TASK_QUEUED));
+ 
+ 	/* rq migration */
+@@ -1837,6 +1872,8 @@ static void do_enqueue_task(struct rq *rq, struct task_struct *p, u64 enq_flags,
+ 			goto global;
+ 	}
+ 
++	// select_rq_taskのときにすでにdirect dispatchがマークされていた場合
++	// ここではops.enqueueの呼び出しを行わず、直ちにdirect_dispatchを行う
+ 	if (p->scx.ddsp_dsq_id != SCX_DSQ_INVALID)
+ 		goto direct;
+ 
+@@ -1856,19 +1893,35 @@ static void do_enqueue_task(struct rq *rq, struct task_struct *p, u64 enq_flags,
+ 	/* DSQ bypass didn't trigger, enqueue on the BPF scheduler */
+ 	qseq = rq->scx.ops_qseq++ << SCX_OPSS_QSEQ_SHIFT;
+ 
++	// enqueueを行うときに、ops_stateがQUEUEINGの状態になる。
+ 	WARN_ON_ONCE(atomic_long_read(&p->scx.ops_state) != SCX_OPSS_NONE);
+ 	atomic_long_set(&p->scx.ops_state, SCX_OPSS_QUEUEING | qseq);
+ 
++	// scx_ops.enqueueが呼び出される直前に*direct_dispatch_taskにpが設定される。
++	// ここでの設定は、scx_ops.enqueue内で呼び出されるscx_bpf_dispatchなどの
++	// kfuncsで重要な役割をもってくる（scx_dispatch_commitを参照）。
+ 	ddsp_taskp = this_cpu_ptr(&direct_dispatch_task);
++	// 基本的には*direct_dispatch_taskにはNULLがセットされているはず。
++	// この変数が非NULLとなるのは、ops.enqueueの呼び出し前後か、ops.select_cpuの
++	// 呼び出し前後のみ？
+ 	WARN_ON_ONCE(*ddsp_taskp);
+ 	*ddsp_taskp = p;
+ 
++	// scx_ops.enqueueの呼び出し
+ 	SCX_CALL_OP_TASK(SCX_KF_ENQUEUE, enqueue, p, enq_flags);
+ 
++	// ops.enqueueを呼び出し後は、*direct_dispatch_taskにNULLをセットする。
+ 	*ddsp_taskp = NULL;
++
++	// ops.enqueueの中で1回でもscx_bpf_dispatchが呼び出されていれば、
++	// p->scx.ddsp_dsq_idにはDSQの識別子がセットされることになっている。
+ 	if (p->scx.ddsp_dsq_id != SCX_DSQ_INVALID)
+ 		goto direct;
+ 
++	// direct dispatchではないとき（これはすなわちenqueueの内部でscx_bpf_dipatch
++	// が呼び出されなかったことを意味する？）
++	// この場合、タスクの所有権は完全にBPFスケジューラの方に渡っている。
++	// TODO: ここわからん???
+ 	/*
+ 	 * If not directly dispatched, QUEUEING isn't clear yet and dispatch or
+ 	 * dequeue may be waiting. The store_release matches their load_acquire.
+@@ -1957,6 +2010,7 @@ static void enqueue_task_scx(struct rq *rq, struct task_struct *p, int enq_flags
+ 	rq->scx.nr_running++;
+ 	add_nr_running(rq, 1);
+ 
++	// enqueueが呼び出される前にrunnableが呼び出されている
+ 	if (SCX_HAS_OP(runnable))
+ 		SCX_CALL_OP_TASK(SCX_KF_REST, runnable, p, enq_flags);
+ 
+@@ -1968,6 +2022,8 @@ static void enqueue_task_scx(struct rq *rq, struct task_struct *p, int enq_flags
+ 	rq->scx.flags &= ~SCX_RQ_IN_WAKEUP;
+ }
+ 
++// タスクが実行可能状態でなくなったときに呼び出される関数。
++// sched_class->dequeue_taskから呼び出される
+ static void ops_dequeue(struct task_struct *p, u64 deq_flags)
+ {
+ 	unsigned long opss;
+@@ -1988,6 +2044,8 @@ static void ops_dequeue(struct task_struct *p, u64 deq_flags)
+ 		 */
+ 		BUG();
+ 	case SCX_OPSS_QUEUED:
++		// タスクの所有権がBPFスケジューラ側にある場合、ops.dequeueを呼び出したあとに、
++		// タスクの所有権をSCXに戻す。
+ 		if (SCX_HAS_OP(dequeue))
+ 			SCX_CALL_OP_TASK(SCX_KF_REST, dequeue, p, deq_flags);
+ 
+@@ -2298,6 +2356,7 @@ static bool consume_dispatch_q(struct rq *rq, struct scx_dispatch_q *dsq)
+ 	return false;
+ }
+ 
++// dispatch_to_local_dsq関数の返り値用の型
+ enum dispatch_to_local_dsq_ret {
+ 	DTL_DISPATCHED,		/* successfully dispatched */
+ 	DTL_LOST,		/* lost race to dequeue */
+@@ -2342,6 +2401,21 @@ dispatch_to_local_dsq(struct rq *rq, u64 dsq_id, struct task_struct *p,
+ 		return DTL_NOT_LOCAL;
+ 	}
+ 
++	// ディスパッチ先のrqにすでにpが所属していた場合、lock dancingの危険なく、ディスパッチ
++	// することができる。
++	// 
++	// これは、scx_ops->select_cpu()での処理がいかに重要か、を表している？
++	// scx_ops->select_cpu()でcpu_Aが返されたとする。その後、グローバルDSQに
++	// タスクがディスパッチされると、タスクはrq_Aに紐付いたままグローバルDSQにpushされる。
++	// ローカルDSQが空になったcpuは、この関数を呼び出してグローバルDSQから
++	// ローカルDSQにタスクを移動しようと試みる。そのとき、src_rqはrq_Aであり、
++	// dst_rqはそのローカルDSQのrqである。
++	// もし、src_rqとdst_rqが一致しなかった場合、rqからrqへのタスクの移動があるが、
++	// このとき、どちらのロックも取る必要がでてくるため、処理が重くなってしまう？
++	// このような重い処理をできる限り避けるためにも、scx_ops->select_cpu()で返す
++	// 値はきちんと適切なものを選ぶべきである。
++	//
++	// 多分、、、。
+ 	/* if dispatching to @rq that @p is already on, no lock dancing needed */
+ 	if (rq == src_rq && rq == dst_rq) {
+ 		dispatch_enqueue(&dst_rq->scx.local_dsq, p,
+@@ -2453,9 +2527,14 @@ static void finish_dispatch(struct rq *rq, struct task_struct *p,
+ 	switch (opss & SCX_OPSS_STATE_MASK) {
+ 	case SCX_OPSS_DISPATCHING:
+ 	case SCX_OPSS_NONE:
++		// 状態がDISPATCHINGかNONEのときは、すでに他のCPUでディスパッチの処理が
++		// 開始されていることを意味する。その場合は、このCPUがディスパッチを行う
++		// 必要はないため、何もしない。
+ 		/* someone else already got to it */
+ 		return;
+ 	case SCX_OPSS_QUEUED:
++		// 状態がQUEUEDの場合は、まだどのCPUもこのタスクのディスパッチを行っていない
++		// ことを意味する。そのため、このCPUがディスパッチ処理を行う。
+ 		/*
+ 		 * If qseq doesn't match, @p has gone through at least one
+ 		 * dispatch/dequeue and re-enqueue cycle between
+@@ -2464,6 +2543,9 @@ static void finish_dispatch(struct rq *rq, struct task_struct *p,
+ 		if ((opss & SCX_OPSS_QSEQ_MASK) != qseq_at_dispatch)
+ 			return;
+ 
++		// p->scx.ops_stateにDISPATCHをセットする。
++		// この処理はcmpxchgによって行うことで、上の読み出し時からここでの書き込みまでの
++		// 間に他のCPUがディスパッチ処理を開始した場合を検知できるようにしてある。
+ 		/*
+ 		 * While we know @p is accessible, we don't yet have a claim on
+ 		 * it - the BPF scheduler is allowed to dispatch tasks
+@@ -2476,6 +2558,8 @@ static void finish_dispatch(struct rq *rq, struct task_struct *p,
+ 			break;
+ 		goto retry;
+ 	case SCX_OPSS_QUEUEING:
++		// 他でこのタスクをBPFスケジューラ側に移動しようとしているものがいる。
++		// その場合は、いったん待機してやり直す。
+ 		/*
+ 		 * do_enqueue_task() is in the process of transferring the task
+ 		 * to the BPF scheduler while holding @p's rq lock. As we aren't
+@@ -2488,6 +2572,7 @@ static void finish_dispatch(struct rq *rq, struct task_struct *p,
+ 
+ 	BUG_ON(!(p->scx.flags & SCX_TASK_QUEUED));
+ 
++	// dispatch_enqueueを呼び出し、ディスパッチ処理を完了する
+ 	switch (dispatch_to_local_dsq(rq, dsq_id, p, enq_flags)) {
+ 	case DTL_DISPATCHED:
+ 		break;
+@@ -2504,11 +2589,13 @@ static void finish_dispatch(struct rq *rq, struct task_struct *p,
+ 	}
+ }
+ 
++// scx_dsp_ctxに溜まっていたディスパッチ用タスクのディスパッチ処理を完了する。
+ static void flush_dispatch_buf(struct rq *rq)
+ {
+ 	struct scx_dsp_ctx *dspc = this_cpu_ptr(scx_dsp_ctx);
+ 	u32 u;
+ 
++	// バッファに置かれたそれぞれのエントリに対してfinish_dispatchを呼び出す。
+ 	for (u = 0; u < dspc->cursor; u++) {
+ 		struct scx_dsp_buf_ent *ent = &dspc->buf[u];
+ 
+@@ -2516,10 +2603,19 @@ static void flush_dispatch_buf(struct rq *rq)
+ 				ent->enq_flags);
+ 	}
+ 
++	// ディスパッチしたタスクの数をnr_tasksにセットし、
++	// バッファを空にする
+ 	dspc->nr_tasks += dspc->cursor;
+ 	dspc->cursor = 0;
+ }
+ 
++// sched_class->balanceから呼び出される関数。
++// この関数はpick_next_taskの前に常に呼び出されるようになっており、
++// この関数内でグローバルDSQからローカルDSQにタスクを移動させたり、
++// ops.dispatchを何度も呼び出したりする。
++//
++// この関数の返り値は、ローカルDSQにタスクが存在しているかどうか、を意味する。
++// trueのときは存在しており、falseのときは存在していない。
+ static int balance_one(struct rq *rq, struct task_struct *prev, bool local)
+ {
+ 	struct scx_dsp_ctx *dspc = this_cpu_ptr(scx_dsp_ctx);
+@@ -2570,10 +2666,15 @@ static int balance_one(struct rq *rq, struct task_struct *prev, bool local)
+ 		}
+ 	}
+ 
++	// すでにローカルDSQにタスクが存在していれば直ちに終了
++	// この場合、グローバルDSQをconsumeしたり、
++	// ops.dispatchを呼び出すことはないので注意。
+ 	/* if there already are tasks to run, nothing to do */
+ 	if (rq->scx.local_dsq.nr)
+ 		goto has_tasks;
+ 
++	// ローカルDSQにタスクがなければ、グローバルDSQからタスクの移動を試みる。
++	// 成功した場合、ローカルDSQにはタスクが存在しているため、終了する。
+ 	if (consume_dispatch_q(rq, &scx_dsq_global))
+ 		goto has_tasks;
+ 
+@@ -2582,6 +2683,8 @@ static int balance_one(struct rq *rq, struct task_struct *prev, bool local)
+ 
+ 	dspc->rq = rq;
+ 
++	// ローカルDSQにタスクが入ってなくて、グローバルDSQにもタスクが入っていなかった場合は、
++	// ops.dispatchを呼び出して、カスタムDSQからのタスクの移動を試みる。
+ 	/*
+ 	 * The dispatch loop. Because flush_dispatch_buf() may drop the rq lock,
+ 	 * the local DSQ might still end up empty after a successful
+@@ -2590,13 +2693,22 @@ static int balance_one(struct rq *rq, struct task_struct *prev, bool local)
+ 	 * looping behavior to simplify its implementation.
+ 	 */
+ 	do {
++		// dspc->nr_tasksは、scx_ops->dispatch()でディスパッチした
++		// タスクの数をカウントするもの？
++		// このカウンタがwhileの条件部で指定されており、もし、
++		// scx_ops->dispatch()で1つもタスクがディスパッチされていなければ、
++		// このループは終了する。
+ 		dspc->nr_tasks = 0;
+ 
+ 		SCX_CALL_OP(SCX_KF_DISPATCH, dispatch, cpu_of(rq),
+ 			    prev_on_scx ? prev : NULL);
+ 
++		// scx_dsp_ctxに溜まってたディスパッチ処理をまとめて行う。
+ 		flush_dispatch_buf(rq);
+ 
++		// scx_ops->dispatchを呼び出したら、ローカルDSQ→グローバルDSQと
++		// 確認していき、ローカルDSQにタスクを移すことができたなら、ループを
++		// 抜ける。
+ 		if (rq->scx.local_dsq.nr)
+ 			goto has_tasks;
+ 		if (consume_dispatch_q(rq, &scx_dsq_global))
+@@ -2627,6 +2739,7 @@ static int balance_one(struct rq *rq, struct task_struct *prev, bool local)
+ }
+ 
+ #ifdef CONFIG_SMP
++// sched_class.balanceに設定される関数
+ static int balance_scx(struct rq *rq, struct task_struct *prev,
+ 		       struct rq_flags *rf)
+ {
+@@ -2762,6 +2875,11 @@ static void put_prev_task_scx(struct rq *rq, struct task_struct *p)
+ 
+ 	update_curr_scx(rq);
+ 
++	// TODO: ここでrunnable引数に常にtrueが渡されている理由がわからない。
++	//       この関数は、PNTのタイミングなどで呼び出されるが、
++	//       タスクがrunnableではなくなるタイミングもあるはず。そのような
++	//       ケースは別で扱い、ここでは単にrunnable->stoppingという
++	//       遷移のみを扱っている、ということなのだろうか？
+ 	/* see dequeue_task_scx() on why we skip when !QUEUED */
+ 	if (SCX_HAS_OP(stopping) && (p->scx.flags & SCX_TASK_QUEUED))
+ 		SCX_CALL_OP_TASK(SCX_KF_REST, stopping, p, true);
+@@ -2823,6 +2941,7 @@ static struct task_struct *pick_next_task_scx(struct rq *rq)
+ 		balance_one(rq, rq->curr, true);
+ #endif
+ 
++	// ローカルDSQの先頭からタスクを1つ取り出す
+ 	p = first_local_task(rq);
+ 	if (!p)
+ 		return NULL;
+@@ -3107,6 +3226,9 @@ static s32 scx_select_cpu_dfl(struct task_struct *p, s32 prev_cpu,
+ 
+ static int select_task_rq_scx(struct task_struct *p, int prev_cpu, int wake_flags)
+ {
++	// pがexecシステムコールを発行したタイミングはmigrationの絶好の機会である。
++	// そのため、prev_cpu以外の値を返すと、直ちにmigrationの処理が行われることに
++	// なっているが、SCXの場合、（TODO:）
+ 	/*
+ 	 * sched_exec() calls with %WF_EXEC when @p is about to exec(2) as it
+ 	 * can be a good migration opportunity with low cache and memory
+@@ -3124,6 +3246,8 @@ static int select_task_rq_scx(struct task_struct *p, int prev_cpu, int wake_flag
+ 		s32 cpu;
+ 		struct task_struct **ddsp_taskp;
+ 
++		// direct_dispatch_taskの使われ方は、ops.enqueueのときと一緒。
++		// 詳細はdo_enqueue_taskのコメント部分を読んで！
+ 		ddsp_taskp = this_cpu_ptr(&direct_dispatch_task);
+ 		WARN_ON_ONCE(*ddsp_taskp);
+ 		*ddsp_taskp = p;
+@@ -3185,12 +3309,18 @@ void __scx_update_idle(struct rq *rq, bool idle)
+ {
+ 	int cpu = cpu_of(rq);
+ 
++	// update_idleコールバックが実装されていて、かつ、%SCX_OPS_KEEP_BUILTIN_IDLE
++	// フラグがセットされていなかった場合、カーネル側ではIDLE CPUの管理を行わないことに
++	// なっている。
+ 	if (SCX_HAS_OP(update_idle)) {
+ 		SCX_CALL_OP(SCX_KF_REST, update_idle, cpu_of(rq), idle);
+ 		if (!static_branch_unlikely(&scx_builtin_idle_enabled))
+ 			return;
+ 	}
+ 
++	// scx_ops.flagsに%SCX_OPS_KEEP_BUILTIN_IDLEフラグが指定されているか、
++	// scx_ops.update_idleコールバックが用意されていなかった場合は、このあとの処理
++	// を行う。カーネル側でIDLE CPUの情報を管理する。
+ 	if (idle)
+ 		cpumask_set_cpu(cpu, idle_masks.cpu);
+ 	else
+@@ -3217,6 +3347,8 @@ void __scx_update_idle(struct rq *rq, bool idle)
+ #endif
+ }
+ 
++// CPUのホットプラグを扱うための関数？？？
++// 呼び出し経路とか、あまり理解してないわ。
+ static void handle_hotplug(struct rq *rq, bool online)
+ {
+ 	int cpu = cpu_of(rq);
+@@ -3379,6 +3511,14 @@ static void scx_set_task_state(struct task_struct *p, enum scx_task_state state)
+ 	p->scx.flags |= state << SCX_TASK_STATE_SHIFT;
+ }
+ 
++// タスクが生成されたとき、それがSCHED_EXTのタスクでなくとも必ず呼ばれる関数。
++// 呼び出し経路は、
++//  - scx_fork（ただし、scx_enable()==trueのときのみ）
++//  - ops.enable（つまり、scxスケジューラがenableになるときに、その時点で存在してい
++//                すべてのタスクに対して1回ずつ実行する）
++//
++// scx_forkの呼び出し経路をたどるのが大変だったのでメモ
++//  - copy_process --> sched_cgroup_fork --> scx_fork --> scx_ope_init_task
+ static int scx_ops_init_task(struct task_struct *p, struct task_group *tg, bool fork)
+ {
+ 	int ret;
+@@ -3424,6 +3564,9 @@ static int scx_ops_init_task(struct task_struct *p, struct task_group *tg, bool
+ 	return 0;
+ }
+ 
++// この関数が呼び出される場所は以下の２箇所。
++// - cx_post_fork：forkのときに、新しいタスクのsched_classがext_sched_classだったときに呼び出される。
++// - switching_to_scx：タスクのsched_classがext_sched_classに切り替わったときに呼び出される。
+ static void scx_ops_enable_task(struct task_struct *p)
+ {
+ 	u32 weight;
+@@ -3532,6 +3675,7 @@ void scx_post_fork(struct task_struct *p)
+ 	if (scx_enabled()) {
+ 		scx_set_task_state(p, SCX_TASK_READY);
+ 
++		// taskがforkされたら、scx_ops.enableを呼び出す。
+ 		/*
+ 		 * Enable the task immediately if it's running on sched_ext.
+ 		 * Otherwise, it'll be enabled in switching_to_scx() if and
+@@ -3605,6 +3749,8 @@ static void prio_changed_scx(struct rq *rq, struct task_struct *p, int oldprio)
+ {
+ }
+ 
++// sched_class.switching_toの実装本体
++// タスクpが属するsched_classがSCXに切り替わったときに呼び出される関数
+ static void switching_to_scx(struct rq *rq, struct task_struct *p)
+ {
+ 	scx_ops_enable_task(p);
+@@ -3626,6 +3772,13 @@ static void switched_from_scx(struct rq *rq, struct task_struct *p)
+ static void wakeup_preempt_scx(struct rq *rq, struct task_struct *p,int wake_flags) {}
+ static void switched_to_scx(struct rq *rq, struct task_struct *p) {}
+ 
++// SCXでは、特定のタスクだけSCHED_EXTに入らないようにする、といった管理ができる。
++// p->scx.disallowにtrueがセットされている場合「他のクラス→EXTクラス」への
++// 遷移が禁止される。
++//
++// この関数は__sched_setschedulerの序盤の方で呼び出されており、ここでのチェックに
++// 引っかかった場合、sched_setschedulerシステムコールによるポリシーの変更が
++// 失敗するようになっている。
+ int scx_check_setscheduler(struct task_struct *p, int policy)
+ {
+ 	lockdep_assert_rq_held(task_rq(p));
+@@ -3880,6 +4033,15 @@ static const struct kset_uevent_ops scx_uevent_ops = {
+ 	.uevent = scx_uevent,
+ };
+ 
++// タスクのスケジューリングクラスをfair_sched_classにするべきか
++// ext_sched_classにするべきかどうか、を判定する関数。fork時などに呼び出される。
++// 
++// trueを返すとp->sched_classにはext_sched_classがセットされる。
++// falseを返すとp->sched_classにはfair_sched_classがセットされる。
++// 
++// ここの判定は、scx_switching_allの状態によって変わってくる。
++//  - trueのときは、policyがSCHED_NORMALのものもすべてextクラスに設定される。
++//  - falseのときは、policyがSCHED_EXTのもののみextクラスに設定される。
+ /*
+  * Used by sched_fork() and __setscheduler_prio() to pick the matching
+  * sched_class. dl/rt are already handled.
+@@ -4732,6 +4894,8 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
+ 	 */
+ 	spin_lock_irq(&scx_tasks_lock);
+ 
++	// 現在存在しているタスクそれぞれについてループを回し、
++	// ops.init_task(p)などを実行する。
+ 	scx_task_iter_init(&sti);
+ 	while ((p = scx_task_iter_next_locked(&sti, false))) {
+ 		get_task_struct(p);
+@@ -4740,6 +4904,7 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
+ 
+ 		ret = scx_ops_init_task(p, task_group(p), false);
+ 		if (ret) {
++			// init_taskが失敗したとき
+ 			put_task_struct(p);
+ 			spin_lock_irq(&scx_tasks_lock);
+ 			scx_task_iter_exit(&sti);
+@@ -4786,6 +4951,10 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
+ 	 */
+ 	WRITE_ONCE(scx_switching_all, !(ops->flags & SCX_OPS_SWITCH_PARTIAL));
+ 
++	// 存在しているタスクそれぞれに対してループを回し、
++	// check_class_changinなどを実行する。この関数は、タスクのsched_classが
++	// 変更されたときなどに、switching_toコールバックを実行するような関数であり、
++	// その内部で、enableなどが呼び出される。
+ 	scx_task_iter_init(&sti);
+ 	while ((p = scx_task_iter_next_locked(&sti, false))) {
+ 		const struct sched_class *old_class = p->sched_class;
+@@ -5491,8 +5660,12 @@ static const struct btf_kfunc_id_set scx_kfunc_set_select_cpu = {
+ 	.set			= &scx_kfunc_ids_select_cpu,
+ };
+ 
++// scx_bpf_dispatchで最初の方に呼ばれる関数
++// 呼び出しのあったBPFプログラムからscx_bpf_dispatchの処理を行っていいかどうかを
++// 検証するための関数であり、もし不適切であれば、falseを返す。
+ static bool scx_dispatch_preamble(struct task_struct *p, u64 enq_flags)
+ {
++	// このkfuncの呼び出しが許可されていなければ直ちに終了
+ 	if (!scx_kf_allowed(SCX_KF_ENQUEUE | SCX_KF_DISPATCH))
+ 		return false;
+ 
+@@ -5503,6 +5676,8 @@ static bool scx_dispatch_preamble(struct task_struct *p, u64 enq_flags)
+ 		return false;
+ 	}
+ 
++	// enq_flagsの上位bitはカーネル内部でのみ使われるフラグとなっているため、
++	// BPF側から指定された場合は無効となる。
+ 	if (unlikely(enq_flags & __SCX_ENQ_INTERNAL_MASK)) {
+ 		scx_ops_error("invalid enq_flags 0x%llx", enq_flags);
+ 		return false;
+@@ -5516,17 +5691,26 @@ static void scx_dispatch_commit(struct task_struct *p, u64 dsq_id, u64 enq_flags
+ 	struct scx_dsp_ctx *dspc = this_cpu_ptr(scx_dsp_ctx);
+ 	struct task_struct *ddsp_task;
+ 
++	// この呼び出しがops.enqueueかops.select_cpu内部からのものだった場合、
++	// direct_dispatch_taskには対応するタスクへのポインタが格納されている。
++	// その場合は、
+ 	ddsp_task = __this_cpu_read(direct_dispatch_task);
+ 	if (ddsp_task) {
+ 		mark_direct_dispatch(ddsp_task, p, dsq_id, enq_flags);
+ 		return;
+ 	}
+ 
++	// scx_ops.dispatch()からの呼び出しの場合
++
++	// scx_dsp_ctxのバッファがいっぱいになっていた場合、
++	// つまり、許可されているバッチのサイズを超えそうな場合はエラー。
+ 	if (unlikely(dspc->cursor >= scx_dsp_max_batch)) {
+ 		scx_ops_error("dispatch buffer overflow");
+ 		return;
+ 	}
+ 
++	// scx_dsp_ctxのバッファにタスクをプッシュする
++	// 実際にタスクのディスパッチを行うのは、flush_dispatch_buf関数。
+ 	dspc->buf[dspc->cursor++] = (struct scx_dsp_buf_ent){
+ 		.task = p,
+ 		.qseq = atomic_long_read(&p->scx.ops_state) & SCX_OPSS_QSEQ_MASK,
+@@ -5576,12 +5760,17 @@ __bpf_kfunc_start_defs();
+ __bpf_kfunc void scx_bpf_dispatch(struct task_struct *p, u64 dsq_id, u64 slice,
+ 				  u64 enq_flags)
+ {
++	// 呼び出しの権利があるか、引数が適切なものか、などをチェックする
+ 	if (!scx_dispatch_preamble(p, enq_flags))
+ 		return;
+ 
+ 	if (slice)
+ 		p->scx.slice = slice;
+ 	else
++		// ?:はGNU拡張の演算子で、p->scx.sliceが非ゼロのときはその値を、
++		// そうでないときは、1を返すようなもの。
++		// つまり、sliceに0が設定されたときは、現在のスライスの値をそのまま使うか、
++		// もしくは最小値"1"をセットする、といった処理になる。
+ 		p->scx.slice = p->scx.slice ?: 1;
+ 
+ 	scx_dispatch_commit(p, dsq_id, enq_flags);
+@@ -5644,6 +5833,8 @@ __bpf_kfunc u32 scx_bpf_dispatch_nr_slots(void)
+ 	if (!scx_kf_allowed(SCX_KF_DISPATCH))
+ 		return 0;
+ 
++	// scx_dsp_max_batchはscx_dsp_ctxのバッファのサイズを所持している。
++	// つまり、ここではバッファの残りのサイズを返している
+ 	return scx_dsp_max_batch - __this_cpu_read(scx_dsp_ctx->cursor);
+ }
+ 
+@@ -5726,6 +5917,13 @@ static const struct btf_kfunc_id_set scx_kfunc_set_dispatch = {
+ 
+ __bpf_kfunc_start_defs();
+ 
++// cpu_releaseコールバック内からのみ利用可能
++// 処理は、
++//   1. ローカルDSQから（p->migration_pendingがfalseの）タスクをすべて取り出して、
++//      tasksにつなげる。
++//   2. tasksにつながれているタスクに対して順番にdo_enqueue_taskを実行していく（つまり、
++//      enqueueコールバックを呼び出す）。
++// 返り値は、enqueue処理が行われた回数を表す。
+ /**
+  * scx_bpf_reenqueue_local - Re-enqueue tasks on a local DSQ
+  *
+@@ -5735,6 +5933,7 @@ __bpf_kfunc_start_defs();
+  */
+ __bpf_kfunc u32 scx_bpf_reenqueue_local(void)
+ {
++	// DSQから取り出したタスクを一時的に繋ぎ止めておくためのリスト
+ 	LIST_HEAD(tasks);
+ 	u32 nr_enqueued = 0;
+ 	struct rq *rq;
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index be7be54484c0..858176ace4b5 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -2149,6 +2149,8 @@ static inline void __set_task_cpu(struct task_struct *p, unsigned int cpu)
+ 	 * per-task data have been completed by this moment.
+ 	 */
+ 	smp_wmb();
++	// p->thread_info->cpuはtask_cpu(p)を使って読み出されるものであり、
++	// task_rq(p)のようにすると、ここで設定されたcpuに対応するrqが返されることになっている。
+ 	WRITE_ONCE(task_thread_info(p)->cpu, cpu);
+ 	p->wake_cpu = cpu;
+ #endif
